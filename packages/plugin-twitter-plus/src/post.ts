@@ -152,21 +152,27 @@ export class TwitterPostClient {
     }
 
     private async generateNewTweet(): Promise<void> {
-        if (this.isPosting) {
-            elizaLogger.log("Tweet generation already in progress, skipping");
-            return;
-        }
+        let retryCount = 0;
+        const maxRetries = 3;
 
-        this.isPosting = true;
-        elizaLogger.log("Generating new tweet");
+        while (retryCount < maxRetries) {
+            try {
+                if (this.isPosting) {
+                    elizaLogger.log("Tweet generation already in progress, skipping");
+                    return;
+                }
 
-        try {
-            const tweetResponse = await this.generateTweetContent();
-            await this.postTweet(tweetResponse);
-        } catch (error) {
-            elizaLogger.error("Error generating or posting tweet:", error);
-        } finally {
-            this.isPosting = false;
+                this.isPosting = true;
+                const tweetResponse = await this.generateTweetContent();
+                await this.postTweet(tweetResponse);
+                return;
+            } catch (error) {
+                retryCount++;
+                elizaLogger.error(`Error generating/posting tweet (attempt ${retryCount}/${maxRetries}):`, error);
+                await wait(1000 * retryCount); // Exponential backoff
+            } finally {
+                this.isPosting = false;
+            }
         }
     }
 
