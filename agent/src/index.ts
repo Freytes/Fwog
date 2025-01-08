@@ -81,6 +81,7 @@ import { openWeatherPlugin } from "@elizaos/plugin-open-weather";
 import { artheraPlugin } from "@elizaos/plugin-arthera";
 import { stargazePlugin } from "@elizaos/plugin-stargaze";
 import { obsidianPlugin } from "@elizaos/plugin-obsidian";
+import createRabbiTraderPlugin from "@elizaos/plugin-rabbi-trader";
 import Database from "better-sqlite3";
 import fs from "fs";
 import net from "net";
@@ -539,13 +540,34 @@ export async function createAgent(
     }
 
     let goatPlugin: any | undefined;
+    let rabbiPlugin: any | undefined;
 
     if (getSecret(character, "EVM_PRIVATE_KEY")) {
         goatPlugin = await createGoatPlugin((secret) =>
             getSecret(character, secret)
         );
     }
+        if (getSecret(character, "SOLANA_PRIVATE_KEY")) {
+        const runtime = new AgentRuntime({
+            databaseAdapter: db,
+            token,
+            modelProvider: character.modelProvider,
+            evaluators: [],
+            character,
+            plugins: [],
+            providers: [],
+            actions: [],
+            services: [],
+            managers: [],
+            cacheManager: cache,
+            fetch: logFetch,
+        });
 
+        rabbiPlugin = await createRabbiTraderPlugin(
+            (secret) => getSecret(character, secret),
+            runtime
+        );
+    }
     // Initialize Reclaim adapter if environment variables are present
     // let verifiableInferenceAdapter;
     // if (
@@ -658,6 +680,7 @@ export async function createAgent(
                 ? webhookPlugin
                 : null,
             goatPlugin,
+            rabbiPlugin,
             getSecret(character, "ABSTRACT_PRIVATE_KEY")
                 ? abstractPlugin
                 : null,
