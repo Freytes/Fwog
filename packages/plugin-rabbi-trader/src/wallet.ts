@@ -1,4 +1,4 @@
-import { elizaLogger, IAgentRuntime } from "@elizaOS/core";
+import { elizaLogger, IAgentRuntime } from "@elizaos/core";
 import {
   Connection,
   Keypair,
@@ -17,7 +17,7 @@ import {  SAFETY_LIMITS } from "./constants";
 export function getWalletKeypair(runtime?: IAgentRuntime): Keypair {
   // Check chain type from token address or configuration
 
-  const privateKeyString = runtime?.getSetting("WALLET_PRIVATE_KEY");
+  const privateKeyString = runtime?.getSetting("WALLET_PRIVATE_KEY") || process.env.WALLET_PRIVATE_KEY;
   if (!privateKeyString) {
     throw new Error("No wallet private key configured");
   }
