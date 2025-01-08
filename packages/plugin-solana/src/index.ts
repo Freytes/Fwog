@@ -34,3 +34,5 @@ export const solanaPlugin: Plugin = {
 };
 
 export default solanaPlugin;
+
+export { getTokenBalance, getTokenBalances } from './providers/tokenUtils';
