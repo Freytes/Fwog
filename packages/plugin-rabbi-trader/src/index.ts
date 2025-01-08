@@ -1,23 +1,22 @@
-import type { Plugin, IAgentRuntime, Memory, State } from "@elizaOS/core";
-import { elizaLogger, settings } from "@elizaOS/core";
-import { z } from "zod";
-import { TwitterClientInterface } from "@elizaOS/client-twitter";
+import type { Plugin, IAgentRuntime, Memory, State } from "@elizaos/core";
+import { elizaLogger } from "@elizaos/core";
+import { TwitterClientInterface } from "@elizaos/client-twitter";
 import {
   solanaPlugin,
   trustScoreProvider,
   trustEvaluator,
-} from "@elizaOS/plugin-solana";
+} from "@elizaos/plugin-solana";
 import { TokenProvider } from "./providers/token";
 import { Connection, PublicKey } from "@solana/web3.js";
-import type { Chain, WalletClient, Signature, Balance } from "@goat-sdk/core";
-import { getTokenBalance } from "@elizaOS/plugin-solana/src/providers/tokenUtils";
+import type { WalletClient, Signature, Balance } from "@goat-sdk/core";
+import { getTokenBalance } from "@elizaos/plugin-solana";
 import * as fs from "fs";
 import * as path from "path";
 import { TrustScoreProvider } from "./providers/trustScoreProvider";
 import { SimulationService } from "./services/simulationService";
-import { SAFETY_LIMITS } from "./constants";
+import {  SAFETY_LIMITS } from "./constants";
 import NodeCache from "node-cache";
-import { TrustScoreDatabase } from "@elizaOS/packlages/plugin-trustdb";
+import { TrustScoreDatabase } from "@elizaos/plugin-trustdb";
 import { v4 as uuidv4 } from "uuid";
 import { actions } from "./actions";
 import {
@@ -54,6 +53,11 @@ interface ExtendedWalletProvider extends WalletClient {
     amountIn: number;
     slippage: number;
   }) => Promise<any>;
+  get: (runtime: IAgentRuntime, message: Memory, state?: State) => Promise<{
+    balance: number;
+    address: string;
+    chain: string;
+  }>;
 }
 
 const REQUIRED_SETTINGS = {
@@ -71,12 +75,16 @@ interface ExtendedPlugin extends Plugin {
   actions: any[];
   services: any[];
   autoStart?: boolean;
+  initialize?: (runtime: IAgentRuntime) => Promise<void>;
+  cleanup: () => void;
+  onStart: () => Promise<void>;
 }
 
 // Add this helper function
 function validateSolanaAddress(address: string | undefined): boolean {
   if (!address) return false;
   try {
+
     // Handle Solana addresses
     if (!/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(address)) {
       elizaLogger.warn(`Solana address failed format check: ${address}`);
@@ -87,7 +95,7 @@ function validateSolanaAddress(address: string | undefined): boolean {
     const pubKey = new PublicKey(address);
     const isValid = Boolean(pubKey.toBase58());
     elizaLogger.log(
-      `Solana address validation result for ${address}: ${isValid}`
+      `Solana address validation result for ${address}: ${isValid}`,
     );
     return isValid;
   } catch (error) {
@@ -99,29 +107,30 @@ function validateSolanaAddress(address: string | undefined): boolean {
 // Add function to load token addresses
 export function loadTokenAddresses(): string[] {
   try {
-    const filePath = path.resolve(
-      process.cwd(),
-      "../characters/tokens/tokenaddresses.json"
-    );
+    const filePath = path.resolve(process.cwd(), "../packages/plugin-rabbi-trader/src/tokens/tokenaddresses.json");
+    elizaLogger.log("Loading token addresses from:", filePath);
+
+    if (!fs.existsSync(filePath)) {
+      const error = `Token addresses file not found at: ${filePath}`;
+      elizaLogger.error(error);
+      throw new Error(error);
+    }
+
     const data = fs.readFileSync(filePath, "utf8");
     const addresses = JSON.parse(data);
 
     // Validate addresses
-    const validAddresses = addresses.filter((addr: string) => {
-      // Solana address validation
-      return validateSolanaAddress(addr);
-    });
+    const validAddresses = addresses.filter((addr: string) => validateSolanaAddress(addr));
 
     elizaLogger.log("Loaded token addresses:", {
       total: validAddresses.length,
-      solana: validAddresses.filter((addr) => !addr.startsWith("0x")).length,
-      base: validAddresses.filter((addr) => addr.startsWith("0x")).length,
+      addresses: validAddresses
     });
 
     return validAddresses;
   } catch (error) {
     elizaLogger.error("Failed to load token addresses:", error);
-    throw new Error("Token addresses file not found or invalid");
+    throw error;
   }
 }
 
@@ -138,12 +147,6 @@ const tokenCache = new NodeCache({
   stdTTL: 1200, // 20 minutes in seconds
   checkperiod: 120, // Check for expired entries every 2 minutes
 });
-
-// Add near the top with other interfaces
-interface SkipWaitCache {
-  lastTweet: number;
-  action: "WAIT" | "SKIP";
-}
 
 // Add near other cache instances
 const skipWaitCache = new NodeCache({
@@ -180,7 +183,7 @@ function canTweet(tweetType: "trade" | "market_search"): boolean {
 
   if (rateLimit.count >= MAX_TWEETS_PER_HOUR[tweetType]) {
     elizaLogger.warn(
-      `Tweet rate limit reached for ${tweetType}: ${rateLimit.count} tweets this hour`
+      `Tweet rate limit reached for ${tweetType}: ${rateLimit.count} tweets this hour`,
     );
     return false;
   }
@@ -267,19 +270,19 @@ async function updateSellDetails(
   recommenderId: string,
   tradeAmount: number,
   latestTrade: any,
-  tokenData: any
+  tokenData: any,
 ) {
   const trustScoreDb = new TrustScoreDatabase(runtime.databaseAdapter.db);
 
   const trade = await trustScoreDb.getLatestTradePerformance(
     tokenAddress,
     recommenderId,
-    false
+    false,
   );
 
   if (!trade) {
     elizaLogger.error(
-      `No trade found for token ${tokenAddress} and recommender ${recommenderId}`
+      `No trade found for token ${tokenAddress} and recommender ${recommenderId}`,
     );
     throw new Error("No trade found to update");
   }
@@ -330,7 +333,7 @@ async function updateSellDetails(
           recommenderId,
           buyTimeStamp: trade.buy_timeStamp,
           isSimulation: false,
-        }
+        },
       );
 
       const success = await trustScoreDb.updateTradePerformanceOnSell(
@@ -338,7 +341,7 @@ async function updateSellDetails(
         recommenderId, // 2. WHERE recommender_id = ?
         trade.buy_timeStamp, // 3. WHERE buy_timeStamp = ?
         sellDetails, // 4. SET clause parameters
-        false // 5. isSimulation flag
+        false, // 5. isSimulation flag
       );
 
       if (!success) {
@@ -413,7 +416,7 @@ declare module "@elizaos/plugin-trustdb" {
       recommenderId: string, // recommenderId second
       buyTimeStamp: string, // buyTimeStamp third
       sellDetails: SellDetailsData, // sellDetails fourth
-      isSimulation: boolean // isSimulation fifth
+      isSimulation: boolean, // isSimulation fifth
     ): boolean;
   }
 }
@@ -421,228 +424,307 @@ declare module "@elizaos/plugin-trustdb" {
 async function getChainBalance(
   connection: Connection,
   walletAddress: PublicKey,
-  tokenAddress: string
+  tokenAddress: string,
 ): Promise<number> {
   // Use existing Solana balance fetching logic
   return await getTokenBalance(
     connection,
     walletAddress,
-    new PublicKey(tokenAddress)
+    new PublicKey(tokenAddress),
   );
 }
 
+let tradingInterval: NodeJS.Timeout;
+
+// Add this interface near the top with other interfaces
+interface PluginManager {
+    start(): Promise<void>;
+}
+
 async function createRabbiTraderPlugin(
-  getSetting: (key: string) => string | undefined,
-  runtime?: IAgentRuntime
-): Promise<Plugin> {
-  // Define resumeTrading at the start of the function
-  const resumeTrading = async () => {
-    // Load and analyze tokens
-    const tokenAddresses = loadTokenAddresses().filter(
-      (addr) => !addr.startsWith("0x")
+    getSetting: (key: string) => string | undefined,
+    runtime?: IAgentRuntime,
+): Promise<Plugin & PluginManager> {  // Update return type
+    elizaLogger.log("[1] Starting Rabbi Trader plugin initialization");
+
+    // Move connection initialization to the top
+    const connection = new Connection(
+        runtime?.getSetting("RPC_URL") || "https://api.mainnet-beta.solana.com",
     );
-    elizaLogger.log(`Analyzing ${tokenAddresses.length} Solana tokens...`);
+    elizaLogger.log("[2] Solana connection created");
 
-    // Analyze regular token list
-    for (const tokenAddress of tokenAddresses) {
-      await analyzeToken(runtime, connection, twitterService, tokenAddress);
-    }
-
-    // Add delay between iterations
-    await new Promise((resolve) => setTimeout(resolve, 1200000)); // 20 minutes
-  };
-
-  elizaLogger.log("Starting GOAT plugin initialization");
-
-  // Move connection initialization to the top
-  const connection = new Connection(
-    runtime?.getSetting("RPC_URL") || "https://api.mainnet-beta.solana.com"
-  );
-
-  const keypair = getWalletKeypair(runtime);
-
-  // Validate required settings
-  const missingSettings: string[] = [];
-  for (const [key, description] of Object.entries(REQUIRED_SETTINGS)) {
-    if (!getSetting(key)) {
-      missingSettings.push(`${key} (${description})`);
-    }
-  }
-
-  if (missingSettings.length > 0) {
-    const errorMsg = `Missing required settings: ${missingSettings.join(", ")}`;
-    elizaLogger.error(errorMsg);
-    throw new Error(errorMsg);
-  }
-
-  elizaLogger.log("Initializing Solana connection...");
-  let walletProvider: ExtendedWalletProvider = {
-    connection,
-    getChain: () => ({ type: "solana" }),
-    getAddress: () => keypair.publicKey.toBase58(),
-    signMessage: async (message: string): Promise<Signature> => {
-      throw new Error("Message signing not implemented for Solana wallet");
-    },
-    balanceOf: async (tokenAddress: string): Promise<ExtendedBalance> => {
-      try {
-        if (tokenAddress.startsWith("0x")) {
-          // Handle Base token balance
-          const baseBalance = await getChainBalance(
-            connection,
-            keypair.publicKey,
-            tokenAddress
-          );
-          return {
-            value: BigInt(baseBalance.toString()),
-            decimals: 18, // Base uses 18 decimals
-            formatted: (baseBalance / 1e18).toString(),
-            symbol: "ETH",
-            name: "Base",
-          };
-        } else {
-          // Existing Solana logic
-          const tokenPublicKey = new PublicKey(tokenAddress);
-          const amount = await getTokenBalance(
-            connection,
-            keypair.publicKey,
-            tokenPublicKey
-          );
-          return {
-            value: BigInt(amount.toString()),
-            decimals: 9,
-            formatted: (amount / 1e9).toString(),
-            symbol: "SOL",
-            name: "Solana",
-          };
-        }
-      } catch (error) {
-        return {
-          value: BigInt(0),
-          decimals: tokenAddress.startsWith("0x") ? 18 : 9,
-          formatted: "0",
-          symbol: tokenAddress.startsWith("0x") ? "ETH" : "SOL",
-          name: tokenAddress.startsWith("0x") ? "Base" : "Solana",
-        };
-      }
-    },
-    getMaxBuyAmount: async (tokenAddress: string) => {
-      try {
-        if (tokenAddress.startsWith("0x")) {
-          // Handle Base chain balance
-          const baseBalance = await getChainBalance(
-            connection,
-            keypair.publicKey,
-            tokenAddress
-          );
-          return (baseBalance * 0.9) / 1e18; // Base uses 18 decimals
-        } else {
-          // Handle Solana balance
-          const balance = await connection.getBalance(keypair.publicKey);
-          return (balance * 0.9) / 1e9; // Solana uses 9 decimals
-        }
-      } catch (error) {
-        elizaLogger.error(
-          `Failed to get max buy amount for ${tokenAddress}:`,
-          error
-        );
-        return 0;
-      }
-    },
-    executeTrade: async (params) => {
-      try {
-        return { success: true };
-      } catch (error) {
-        throw error;
-      }
-    },
-    getFormattedPortfolio: async () => "",
-  };
-
-  elizaLogger.log(
-    "Solana connection and wallet provider initialized successfully"
-  );
-
-  // Initialize Twitter service if enabled
-  let twitterService: TwitterService | undefined;
-  try {
-    elizaLogger.log("Configuring Twitter service for trade notifications...");
-    const twitterConfig = TwitterConfigSchema.parse({
-      enabled: getSetting("TWITTER_ENABLED") === "true",
-      username: getSetting("TWITTER_USERNAME"),
-      dryRun: false,
+    const walletPrivateKey = getSetting("WALLET_PRIVATE_KEY") || process.env.WALLET_PRIVATE_KEY;
+    elizaLogger.log("[3] Wallet configuration:", {
+        hasRuntime: !!runtime,
+        hasPrivateKey: !!walletPrivateKey,
+        privateKeyLength: walletPrivateKey?.length || 0
     });
 
-    if (twitterConfig.enabled && runtime) {
-      elizaLogger.log("Starting Twitter client initialization...");
-      const twitterClient = await TwitterClientInterface.start(runtime);
-      twitterService = new TwitterService(twitterClient, twitterConfig);
-
-      // Add delay after initialization
-      await new Promise((resolve) => setTimeout(resolve, 5000));
-
-      elizaLogger.log("Twitter service initialized successfully", {
-        username: twitterConfig.username,
-        dryRun: twitterConfig.dryRun,
-      });
+    if (!walletPrivateKey || walletPrivateKey.length < 32) {
+        const error = `Invalid wallet private key configuration. Length: ${walletPrivateKey?.length || 0}`;
+        elizaLogger.error(error);
+        throw new Error(error);
     }
-  } catch (error) {
-    elizaLogger.error("Failed to initialize Twitter service:", error);
-  }
 
-  elizaLogger.log("Initializing Solana plugin components...");
+    const keypair = getWalletKeypair(runtime);
+    elizaLogger.log("[4] Wallet keypaircreated");
 
-  try {
-    const customActions = actions;
+    // Initialize Twitter service
+    let twitterService: TwitterService | undefined;
+    try {
+        const twitterConfig = TwitterConfigSchema.parse({
+            enabled: getSetting("TWITTER_ENABLED") === "true",
+            username: getSetting("TWITTER_USERNAME"),
+            dryRun: false,
+        });
 
-    // Then update the plugin creation
-    const plugin: ExtendedPlugin = {
-      name: "[Rabbi Trader] Onchain Actions with Solana Integration",
-      description: "Autonomous trading integration with AI analysis",
-      evaluators: [trustEvaluator, ...(solanaPlugin.evaluators || [])],
-      providers: [
-        walletProvider,
-        trustScoreProvider,
-        ...(solanaPlugin.providers || []),
-      ],
-      actions: [...customActions, ...(solanaPlugin.actions || [])],
-      services: [],
-      autoStart: true,
+        if (twitterConfig.enabled && runtime) {
+            const twitterClient = await TwitterClientInterface.start(runtime);
+            twitterService = new TwitterService(twitterClient, twitterConfig);
+        }
+    } catch (error) {
+        elizaLogger.error("Failed to initialize Twitter service:", error);
+    }
+    elizaLogger.log("[5] Initializing Twitter service");
+
+    // Move walletProvider initialization up, before plugin creation
+    elizaLogger.log("Initializing Solana connection...");
+    let walletProvider: ExtendedWalletProvider = {
+        connection,
+        getChain: () => ({ type: "solana" }),
+        getAddress: () => keypair.publicKey.toBase58(),
+        signMessage: async (message: string): Promise<Signature> => {
+            throw new Error("Message signing not implemented for Solana wallet");
+        },
+        balanceOf: async (tokenAddress: string): Promise<ExtendedBalance> => {
+            try {
+                if (tokenAddress.startsWith("0x")) {
+                    // Handle Base token balance
+                    const baseBalance = await getChainBalance(
+                        connection,
+                        keypair.publicKey,
+                        tokenAddress
+                    );
+                    return {
+                        value: BigInt(baseBalance.toString()),
+                        decimals: 18, // Base uses 18 decimals
+                        formatted: (baseBalance / 1e18).toString(),
+                        symbol: "ETH",
+                        name: "Base",
+                    };
+                } else {
+                    // Existing Solana logic
+                    const tokenPublicKey = new PublicKey(tokenAddress);
+                    const amount = await getTokenBalance(
+                        connection,
+                        keypair.publicKey,
+                        tokenPublicKey,
+                    );
+                    return {
+                        value: BigInt(amount.toString()),
+                        decimals: 9,
+                        formatted: (amount / 1e9).toString(),
+                        symbol: "SOL",
+                        name: "Solana",
+                    };
+                }
+            } catch (error) {
+                return {
+                    value: BigInt(0),
+                    decimals: tokenAddress.startsWith("0x") ? 18 : 9,
+                    formatted: "0",
+                    symbol: tokenAddress.startsWith("0x") ? "ETH" : "SOL",
+                    name: tokenAddress.startsWith("0x") ? "Base" : "Solana",
+                };
+            }
+        },
+        getMaxBuyAmount: async (tokenAddress: string) => {
+            try {
+                if (tokenAddress.startsWith("0x")) {
+                    // Handle Base chain balance
+                    const baseBalance = await getChainBalance(
+                        connection,
+                        keypair.publicKey,
+                        tokenAddress
+                    );
+                    return (baseBalance * 0.9) / 1e18; // Base uses 18 decimals
+                } else {
+                    // Handle Solana balance
+                    const balance = await connection.getBalance(keypair.publicKey);
+                    return (balance * 0.9) / 1e9; // Solana uses 9 decimals
+                }
+            } catch (error) {
+                elizaLogger.error(
+                    `Failed to get max buy amount for ${tokenAddress}:`,
+                    error,
+                );
+                return 0;
+            }
+        },
+        executeTrade: async (params) => {
+            try {
+                return { success: true };
+            } catch (error) {
+                throw error;
+            }
+        },
+        getFormattedPortfolio: async () => "",
+        get: async (runtime: IAgentRuntime, message: Memory, state?: State) => {
+            try {
+                const balance = await connection.getBalance(keypair.publicKey);
+                return {
+                    balance: balance / 1e9,
+                    address: keypair.publicKey.toBase58(),
+                    chain: "solana"
+                };
+            } catch (error) {
+                elizaLogger.error("Error in wallet provider get:", error);
+                return null;
+            }
+        }
+    };
+    elizaLogger.log("[6] Creating wallet provider");
+
+    // Validate required settings first
+    const missingSettings: string[] = [];
+    for (const [key, description] of Object.entries(REQUIRED_SETTINGS)) {
+        if (!getSetting(key)) {
+            missingSettings.push(`${key} (${description})`);
+        }
+    }
+
+    if (missingSettings.length > 0) {
+        const errorMsg = `Missing required settings: ${missingSettings.join(", ")}`;
+        elizaLogger.error(errorMsg);
+        throw new Error(errorMsg);
+    }
+
+    // Create the plugin object
+    const plugin: ExtendedPlugin & PluginManager = {
+        name: "[Rabbi Trader] Onchain Actions with Solana Integration",
+        description: "Autonomous trading integration with AI analysis",
+        evaluators: [trustEvaluator, ...(solanaPlugin.evaluators || [])],
+        providers: [
+            walletProvider,
+            trustScoreProvider,
+            ...(solanaPlugin.providers || []),
+        ],
+        actions: [...actions, ...(solanaPlugin.actions || [])],
+        services: [],
+        autoStart: true,
+        initialize: async (rt: IAgentRuntime) => {
+            elizaLogger.log("Rabbi Trader plugin initialization starting...");
+            if (!runtime) {
+                runtime = rt;
+                elizaLogger.log("Runtime stored in plugin");
+            }
+
+            // Initialize plugin components
+            await initializeComponents(runtime);
+
+            elizaLogger.log("Rabbi Trader plugin initialization completed");
+
+            // Automatically start if autoStart is true
+            if (plugin.autoStart) {
+                await plugin.start();
+            }
+        },
+        start: async () => {
+            elizaLogger.log("Rabbi Trader plugin start triggered");
+            if (plugin.onStart) {
+                await plugin.onStart();
+            }
+        },
+        onStart: async () => {
+            elizaLogger.log("Rabbi Trader onStart triggered");
+            if (!runtime?.agentId) {
+                elizaLogger.error("No runtime available in onStart");
+                return;
+            }
+
+            const enableTrading = runtime.getSetting("ENABLE_TRADING") === "true";
+            elizaLogger.log("Trading enabled setting:", enableTrading);
+
+            if (enableTrading) {
+                elizaLogger.log("Trading enabled, initializing trading loop...");
+
+                // Define the trading function
+                const performTrading = async () => {
+                    try {
+                        elizaLogger.log("Starting trading cycle...");
+                        const tokenAddresses = loadTokenAddresses();
+                        elizaLogger.log(`Analyzing ${tokenAddresses.length} tokens...`);
+
+                        for (const tokenAddress of tokenAddresses) {
+                            await analyzeToken(runtime, connection, twitterService, tokenAddress);
+                        }
+
+                        elizaLogger.log("Trading cycle completed");
+                    } catch (error) {
+                        elizaLogger.error("Error in trading cycle:", error);
+                    }
+                };
+
+                try {
+                    // Initial run
+                    elizaLogger.log("Executing initial trading cycle");
+                    await performTrading();
+
+                    // Set up interval with error handling
+                    const interval = Number(runtime.getSetting("TRADING_INTERVAL") || 300000);
+                    elizaLogger.log(`Setting up trading interval: ${interval}ms`);
+
+                    tradingInterval = setInterval(async () => {
+                        try {
+                            await performTrading();
+                        } catch (error) {
+                            elizaLogger.error("Error in trading interval:", error);
+                        }
+                    }, interval);
+
+                    elizaLogger.log("Trading loop initialized successfully");
+                } catch (error) {
+                    elizaLogger.error("Error during trading initialization:", error);
+                }
+            } else {
+                elizaLogger.log("Trading disabled in settings");
+            }
+        },
+        cleanup: () => {
+            elizaLogger.log("Cleaning up Rabbi Trader plugin");
+            if (tradingInterval) {
+                clearInterval(tradingInterval);
+                elizaLogger.log("Trading interval cleared");
+            }
+
+            // Cleanup other resources
+            try {
+                tokenCache.close();
+                skipWaitCache.close();
+                tweetRateCache.close();
+                elizaLogger.log("Caches cleaned up");
+            } catch (error) {
+                elizaLogger.error("Error cleaning up caches:", error);
+            }
+        }
     };
 
-    // Add auto-start trading analysis
-    if (!runtime) return;
+    elizaLogger.log("[7] Plugin object created with configuration:", {
+        name: plugin.name,
+        actionsCount: plugin.actions.length,
+        hasInitialize: !!plugin.initialize,
+        hasOnStart: !!plugin.onStart,
+        hasStart: !!plugin.start
+    });
 
-    elizaLogger.log("Starting autonomous trading system...");
-    const analyzeTradeAction = plugin.actions.find(
-      (a) => a.name === "ANALYZE_TRADE"
-    );
-
-    if (!analyzeTradeAction) return;
-
-    const interval = Number(runtime.getSetting("TRADING_INTERVAL")) || 300000;
-
-    // Then start trading loop if enabled
-    if (!settings.ENABLE_TRADING) return;
-
-    elizaLogger.log("Initializing trading loop...");
-    await resumeTrading();
-    setInterval(resumeTrading, interval);
-
-    elizaLogger.log("GOAT plugin initialization completed successfully");
     return plugin;
-  } catch (error) {
-    elizaLogger.error("Failed to initialize plugin components:", error);
-    throw new Error(
-      `Plugin initialization failed: ${error instanceof Error ? error.message : String(error)}`
-    );
-  }
 }
 
 async function analyzeToken(
   runtime: IAgentRuntime,
   connection: Connection,
   twitterService: TwitterService,
-  tokenAddress: string
+  tokenAddress: string,
 ) {
   try {
     // Check cache first
@@ -652,7 +734,7 @@ async function analyzeToken(
     // Skip if analyzed within last 20 minutes
     if (cachedData && now - cachedData.lastAnalysis < 1200000) {
       elizaLogger.log(
-        `Using cached data for ${tokenAddress}, last analyzed ${Math.floor((now - cachedData.lastAnalysis) / 1000)}s ago`
+        `Using cached data for ${tokenAddress}, last analyzed ${Math.floor((now - cachedData.lastAnalysis) / 1000)}s ago`,
       );
       return;
     }
@@ -707,7 +789,7 @@ async function analyzeToken(
     const latestTrade = trustScoreDb.getLatestTradePerformance(
       tokenAddress,
       runtime.agentId,
-      false // not simulation
+      false, // not simulation
     );
 
     elizaLogger.log(`Latest trade for ${tokenAddress}:`, latestTrade);
@@ -812,12 +894,12 @@ async function analyzeToken(
           } else {
             elizaLogger.log(
               `Trade not recommended for ${tokenAddress}:`,
-              result
+              result,
             );
           }
         } catch (parseError) {}
         return [];
-      }
+      },
     );
     cacheEntry.analysisResult = analysisResult;
     tokenCache.set(tokenAddress, cacheEntry);
@@ -853,7 +935,7 @@ async function buy({
   const simulationService = new SimulationService();
   const simulation = await simulationService.simulateTrade(
     tokenAddress,
-    result.suggestedAmount || SAFETY_LIMITS.MINIMUM_TRADE
+    result.suggestedAmount || SAFETY_LIMITS.MINIMUM_TRADE,
   );
 
   if (simulation.recommendedAction === "EXECUTE") {
@@ -863,12 +945,12 @@ async function buy({
 
       const tradeAmount = Math.min(
         result.suggestedAmount || SAFETY_LIMITS.MINIMUM_TRADE,
-        currentBalance * 0.95 // Leave some SOL for fees
+        currentBalance * 0.95, // Leave some SOL for fees
       );
 
       if (tradeAmount < SAFETY_LIMITS.MINIMUM_TRADE) {
         elizaLogger.warn(
-          `Insufficient balance for trade: ${currentBalance} SOL`
+          `Insufficient balance for trade: ${currentBalance} SOL`,
         );
       }
 
@@ -936,13 +1018,13 @@ async function buy({
         try {
           // Remove the PublicKey validation for Base addresses
           elizaLogger.log(
-            `Attempting to validate token address: ${tokenAddress}`
+            `Attempting to validate token address: ${tokenAddress}`,
           );
           const formattedAddress = tokenAddress.startsWith("0x")
             ? tokenAddress
             : new PublicKey(tokenAddress).toBase58(); // Only convert Solana addresses
           elizaLogger.log(
-            `Token address validated successfully: ${formattedAddress}`
+            `Token address validated successfully: ${formattedAddress}`,
           );
 
           // Create a new recommender ID for this trade
@@ -961,7 +1043,7 @@ async function buy({
           const tradeData = {
             buy_amount: tradeAmount,
             is_simulation: false,
-            token_address: new PublicKey(tokenAddress).toBase58(),
+            token_address:  new PublicKey(tokenAddress).toBase58(),
             buy_price: tokenData.dexScreenerData.pairs[0]?.priceUsd || 0,
             buy_timeStamp: new Date().toISOString(),
             buy_market_cap: tokenData.dexScreenerData.pairs[0]?.marketCap || 0,
@@ -999,11 +1081,11 @@ async function buy({
               liquidity_change: 0,
               rapidDump: false,
             },
-            false
+            false,
           );
 
           elizaLogger.log(
-            `Successfully recorded trade performance for ${tokenAddress}`
+            `Successfully recorded trade performance for ${tokenAddress}`,
           );
         } catch (error) {
           elizaLogger.error("Failed to record trade performance:", {
@@ -1018,7 +1100,7 @@ async function buy({
       } else {
         elizaLogger.error(
           `Trade execution failed for ${tokenAddress}:`,
-          tradeResult.error
+          tradeResult.error,
         );
       }
     } catch (tradeError) {
@@ -1030,7 +1112,7 @@ async function buy({
   } else {
     elizaLogger.log(
       `Simulation rejected trade for ${tokenAddress}:`,
-      simulation
+      simulation,
     );
   }
 }
@@ -1078,8 +1160,8 @@ async function sell({
   const tradeResult = await executeTrade(runtime, {
     tokenAddress,
     amount: tradeAmount,
-    slippage: 0.3, //  30% for Solana
-    chain: "solana",
+    slippage:  0.3, //  30% for Solana
+    chain:  "solana",
   });
 
   if (tradeResult.success) {
@@ -1106,7 +1188,7 @@ async function sell({
       recommender.id,
       tradeAmount,
       latestTrade,
-      tokenData
+      tokenData,
     );
 
     // Post tweet if enabled
@@ -1144,9 +1226,24 @@ async function sell({
   } else {
     elizaLogger.error(
       `Sell execution failed for ${tokenAddress}:`,
-      tradeResult.error
+      tradeResult.error,
     );
   }
+}
+
+// Add helper function to initialize components
+async function initializeComponents(runtime: IAgentRuntime) {
+    try {
+        // Initialize any necessary services/providers
+        const tokenProvider = new TokenProvider("");
+        const trustProvider = new TrustScoreProvider();
+        const simulationService = new SimulationService();
+
+        elizaLogger.log("Components initialized successfully");
+    } catch (error) {
+        elizaLogger.error("Failed to initialize components:", error);
+        throw error;
+    }
 }
 
 export default createRabbiTraderPlugin;
